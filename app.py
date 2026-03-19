@@ -3,6 +3,8 @@ import openeo
 import rasterio
 import numpy as np
 import random
+import sys
+import cv2
 import concurrent.futures
 import skimage.filters
 import skimage.morphology
@@ -10,13 +12,16 @@ from skimage.segmentation import mark_boundaries, slic
 from skimage.color import rgb2gray
 from sklearn.ensemble import RandomForestClassifier
 from skimage.measure import regionprops_table, label as sk_label
-from skimage.morphology import footprint_rectangle
+from skimage.morphology import rectangle, remove_small_objects, label
 from skimage.util import map_array
+from skimage import util
+import higra as hg
 import re
 import xarray as xr
 import os
 import glob
 import pandas as pd
+
 
 st.set_page_config(page_title="OBIA 4 EVER", layout="centered")
 st.title("OBIA Yourself")
@@ -38,31 +43,32 @@ defaults = {
     "step": 1,                      # simple step machine: 1=coords, 2=method, 3=params, 4=sentinel_shown, 5=seg_done
     "rgb_full": None,               # store results so we don't recompute / redraw wrong stuff
     "ndvi": None,                   # NDVI array loaded alongside RGB
-    "rgb_old": None,                # NEW: store old image RGB
-    "ndvi_old": None,               # NEW: store old image NDVI
+    "rgb_old": None,                # store old image RGB
+    "ndvi_old": None,               # store old image NDVI
     "seg_vis": None,
     "seg_params": None,
     "seg_method": "clustering",     # store segmentation method
     "full_path": None,              # compute NDVI without re-downloading
-    "old_path": None,               # NEW: path to old image
-    "recent_date": None,            # NEW: acquisition date of recent image
-    "old_date": None,               # NEW: acquisition date of old image
+    "old_path": None,               # path to old image
+    "recent_date": None,            # acquisition date of recent image
+    "old_date": None,               # acquisition date of old image
     "compactness": 10.0,            # SLIC params
     "n_segments": 2000,
     "ndvi_threshold": 0.2,          # NDVI and mask sliders
     "median_window": 11,            # odd value for median filter
     "use_otsu_auto": False,         # switch between supervised (slider) and true Otsu auto-thresholding
     "ws_input": "grayscale_rgb",    # watershed params
-    "ws_min_region": 200,           # minimum region size (pixels) for watershed merging
-    "classification_method": None,  # NEW: "ml" or "rule_based"
-    "clf": None,                    # NEW: trained classifier
-    "classification_results": None, # NEW: classification output
-    "segments": None,               # NEW: store segments for classification
-    "all_feats_df": None,          # NEW: features dataframe
+    "intensity_threshold": 0.1,     # NEW: threshold for intensity quantization
+    "area_thold": 500,              # NEW: minimum area for segments
+    "classification_method": None,  # "ml" or "rule_based"
+    "clf": None,                    # trained classifier
+    "classification_results": None, # classification output
+    "segments": None,               # store segments for classification
+    "all_feats_df": None,           # features dataframe
     "classification_stats": None,
     "used_confidence": None,
     "training_count": None,
-    "location_name": None,  # NEW: store location display name
+    "location_name": None,         # store location display name
     
 }
 for key, value in defaults.items():
@@ -320,9 +326,6 @@ def neighbourhood(image, x, y):
     keys = list(neighbour_region_numbers)
     keys.sort()
 
-    if len(keys) == 0:
-        return -1
-
     if (keys[0] == -1):
         if (len(keys) == 1):
             return -1
@@ -336,33 +339,63 @@ def neighbourhood(image, x, y):
         else:
             return 0
 
-def watershed_segmentation(image):
+
+
+def watershed_segmentation(image, intensity_threshold=0.1, area_thold=500):
+    """Watershed-based segmentation with intensity and area thresholds."""
+
+    # Create a list of pixel intensities along with their coordinates
     intensity_list = []
     for x in range(image.shape[0]):
         for y in range(image.shape[1]):
-            intensity_list.append((image[x][y], (x, y)))
+            # Append the tuple (quantized_intensity, xy-coord) to the end of the list
+            raw_intensity = image[x][y]
+            quantized_intensity = intensity_threshold * round(raw_intensity / intensity_threshold)
+            intensity_list.append((quantized_intensity, (x, y)))
 
+    # Sort the list with respect to their pixel intensities, in ascending order
     intensity_list.sort()
 
+    # Create an empty segmented_image numpy ndarray initialized to -1's
     segmented_image = np.full(image.shape, -1, dtype=int)
 
+    # Iterate the intensity_list in ascending order and update the segmented image
     region_number = 0
     for i in range(len(intensity_list)):
-        #intensity = intensity_list[i][0]
+        
+        # Get the pixel intensity and the x,y coordinates
+        intensity = intensity_list[i][0]
         x = intensity_list[i][1][0]
         y = intensity_list[i][1][1]
 
+        # Get the region number of the current pixel's region by checking its neighbouring pixels
         region_status = neighbourhood(segmented_image, x, y)
 
-        if (region_status == -1):
+        # Assign region number (or) watershed accordingly, at pixel (x, y) of the segmented image
+        if (region_status == -1): # Separate region
             region_number += 1
             segmented_image[x][y] = region_number
-        elif (region_status == 0):
+        elif (region_status == 0): # Watershed
             segmented_image[x][y] = 0
-        else:
+        else: # Part of another region
             segmented_image[x][y] = region_status
 
-    return segmented_image
+    #Merge small segments   
+    # graph and edge weights for hierarchy
+    size = image.shape[:2]
+    graph = hg.get_4_adjacency_graph(size)
+    edge_weights = hg.weight_graph(graph, image, hg.WeightFunction.mean)
+    tree, altitudes = hg.quasi_flat_zone_hierarchy(graph, edge_weights)
+    # compute attribute and saliency
+    attr = hg.attribute_volume(tree, altitudes)
+    saliency = hg.saliency(tree, attr)/4
+    attr_thold = np.mean(saliency)   # threshold
+
+    segments = hg.labelisation_horizontal_cut_from_threshold(tree, attr, attr_thold)
+    segments = label(remove_small_objects(segments, area_thold))
+
+    # Return the segmented image
+    return segments
 
 def labels_to_boundaries(labels):
     # convert region labels to boundary mask for mark_boundaries
@@ -370,6 +403,17 @@ def labels_to_boundaries(labels):
     edges[1:, :] |= labels[1:, :] != labels[:-1, :]
     edges[:, 1:] |= labels[:, 1:] != labels[:, :-1]
     return edges
+
+
+def fix_watershed_boundaries(labels):
+    """Fill zero labels from watershed boundary artifacts with neighbor-based values."""
+    # Ensure label 0 is not present when later operations require meaningful region labels.
+    if np.any(labels == 0):
+        max_label = int(labels.max())
+        labels = labels.copy()
+        labels[labels == 0] = max_label + 1
+    return labels
+
 
 def array_to_uint8_gray(arr):
     # Accept float image or NDVI; convert to uint8 grayscale 0..255
@@ -381,120 +425,6 @@ def array_to_uint8_gray(arr):
     a = (a - amin) / (amax - amin)
     a = np.clip(a * 255.0, 0, 255).astype(np.uint8)
     return a
-
-def smooth_for_watershed(arr, sigma=1.5):
-    a = np.asarray(arr).astype(np.float32)
-    a = np.nan_to_num(a)
-    return skimage.filters.gaussian(a, sigma=float(sigma), preserve_range=True)
-
-def quantize_for_watershed(arr, levels=32):
-    """
-    Reduce intensity resolution to limit tiny local minima.
-    levels: number of gray levels (e.g. 16, 32, 64)
-    """
-    a = np.asarray(arr).astype(np.float32)
-    a = np.nan_to_num(a)
-
-    amin, amax = a.min(), a.max()
-    if abs(amax - amin) < 1e-12:
-        return a
-
-    a_norm = (a - amin) / (amax - amin)
-    a_q = np.floor(a_norm * levels) / levels
-    return a_q * (amax - amin) + amin
-
-def merge_small_regions(labels, min_size=200):
-    """
-    Merge regions smaller than min_size into the most frequent neighboring label.
-    Assumes labels are ints where 0 can be boundary/unknown and >0 are regions.
-    """
-    if min_size <= 0:
-        return labels
-
-    lab = labels.copy()
-    flat = lab.ravel()
-
-    # sizes per label (ignore 0)
-    max_label = int(flat.max()) if flat.size else 0
-    if max_label <= 0:
-        return lab
-
-    sizes = np.bincount(flat[flat > 0], minlength=max_label + 1)
-
-    small = np.where((sizes > 0) & (sizes < min_size))[0]
-    if small.size == 0:
-        return lab
-
-    H, W = lab.shape
-
-    for s in small:
-        mask = (lab == s)
-        if not mask.any():
-            continue
-
-        # find border pixels of this region (pixels that touch a different label)
-        ys, xs = np.where(mask)
-        neighbor_counts = {}
-
-        for y, x in zip(ys, xs):
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    ny, nx = y + dy, x + dx
-                    if ny < 0 or nx < 0 or ny >= H or nx >= W:
-                        continue
-                    nlab = lab[ny, nx]
-                    if nlab == s or nlab <= 0:
-                        continue
-                    neighbor_counts[nlab] = neighbor_counts.get(nlab, 0) + 1
-
-        if neighbor_counts:
-            # merge into most common neighbor label
-            target = max(neighbor_counts, key=neighbor_counts.get)
-            lab[mask] = target
-        else:
-            # if no valid neighbor, drop to 0
-            lab[mask] = 0
-
-    return lab
-
-def fix_watershed_boundaries(labels):
-    """
-    Assign boundary pixels (label 0) to their nearest neighboring region.
-    This ensures all pixels are classified.
-    """
-    
-    lab = labels.copy()
-    boundary_mask = (lab == 0)
-    
-    if not boundary_mask.any():
-        return lab
-    
-    # Use distance transform to find nearest non-zero label
-    # For each 0 pixel, find the nearest non-zero neighbor
-    H, W = lab.shape
-    
-    for y, x in zip(*np.where(boundary_mask)):
-        # Check 3x3 neighborhood
-        neighbor_labels = []
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < H and 0 <= nx < W:
-                    nlab = lab[ny, nx]
-                    if nlab > 0:
-                        neighbor_labels.append(nlab)
-        
-        # Assign to most common neighbor, or first if tie
-        if neighbor_labels:
-            # Use most common neighbor
-            unique, counts = np.unique(neighbor_labels, return_counts=True)
-            lab[y, x] = unique[np.argmax(counts)]
-    
-    return lab
 
 def extract_features_for_classification(segments, rgb, ndvi):
     """Extract features for each segment for classification."""
@@ -834,282 +764,43 @@ if st.session_state.step == 1:
     DEMO_LOCATIONS.sort(key=lambda x: x["name"])
     
     # Option selector
-    option = st.radio(
-        "Select an option:",
-        ["Choose from pre-loaded locations", "Choose your favorite place on Earth, instead!"],
-        index=0
-    )
+    st.info("Only pre-loaded locations are available now.")
     
-    # =========================================================================
-    # OPTION 1: PRE-LOADED LOCATIONS
-    # =========================================================================
-    if option == "Choose from pre-loaded locations":
-        if len(DEMO_LOCATIONS) == 0:
-            st.error("No pre-loaded locations available. Please use custom coordinates.")
-        else:
-            location_names = [loc["name"] for loc in DEMO_LOCATIONS]
-            
-            selected_location = st.selectbox(
-                "Select a location:",
-                location_names
-            )
-            
-            if st.button("Load location"):
-                # Find selected location data
-                loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == selected_location)
-                
-                file_path = loc_data["file"]
-                
-                if not os.path.exists(file_path):
-                    st.error(f"Demo file not found: {file_path}")
-                    st.stop()
-                
-                # Extract coordinates from the TIFF metadata if possible
-                try:
-                    with rasterio.open(file_path) as src:
-                        bounds = src.bounds
-                        # Calculate center
-                        center_lon = (bounds.left + bounds.right) / 2
-                        center_lat = (bounds.bottom + bounds.top) / 2
-                        st.session_state.coords = (center_lat, center_lon)
-                except:
-                    # Fallback if can't read metadata
-                    st.session_state.coords = (0, 0)
-                
-                # Store paths and location name
-                st.session_state.full_path = file_path
-                st.session_state.recent_date = "2025/26"  # Generic date since we don't have metadata
-                st.session_state.location_name = selected_location  # Store the display name
-                
-                # Load the image
-                with st.spinner(f"Loading {selected_location}..."):
-                    rgb, ndvi = load_sentinel_data(file_path)
-                    st.session_state.rgb_full = rgb
-                    st.session_state.ndvi = ndvi
-                
-                st.session_state.step = 2
-                st.rerun()
-    
-    # =========================================================================
-    # OPTION 2: CUSTOM COORDINATES (with fallback)
-    # =========================================================================
+    if len(DEMO_LOCATIONS) == 0:
+        st.error("No pre-loaded locations available. Please add demo TIFFs to demo_data/ and reload.")
     else:
-        st.markdown("### Enter the coordinates (decimal degrees) of your favorite place on Earth and see the magic happen!")
-        st.caption("Note: Downloads may fail due to API limits. If so, you'll be redirected to pre-loaded locations.")
-        
-        lat = st.text_input("Latitude")
-        lon = st.text_input("Longitude")
-        
-        if st.button("Submit coordinates"):
-            if not lat or not lon:
-                st.error("Please enter both latitude and longitude.")
-            else:
-                try:
-                    lat_val = float(lat)
-                    lon_val = float(lon)
-                    
-                    st.session_state.coords = (lat_val, lon_val)
-                    
-                    # Try to download
-                    download_message = f"{random.choice(mythical_humanoids)} are fetching your custom location..."
-                    
-                    with st.spinner(download_message):
-                        try:
-                            # Attempt download
-                            full_path, recent_date = download_sentinel_data(
-                                lat_val, lon_val, 
-                                st.session_state.username, 
-                                mode="recent",
-                                min_coverage=0.99
-                            )
-                            
-                            if full_path is None:
-                                raise Exception("Download returned no data")
-                            
-                            # Success!
-                            st.session_state.full_path = full_path
-                            st.session_state.recent_date = recent_date
-                            st.session_state.location_name = None  # No display name for custom
-                            
-                            rgb, ndvi = load_sentinel_data(full_path)
-                            st.session_state.rgb_full = rgb
-                            st.session_state.ndvi = ndvi
-                            
-                            st.success("Custom location loaded successfully!")
-                            st.session_state.step = 2
-                            st.rerun()
-                            
-                        except Exception as download_error:
-                            # Download failed - show error and offer fallback
-                            st.error(f"Download failed: {str(download_error)}")
-                            
-                            if len(DEMO_LOCATIONS) > 0:
-                                st.warning("Due to API rate limits, please choose from pre-loaded locations instead.")
-                                
-                                # Show quick selection
-                                st.markdown("---")
-                                st.markdown("### Available pre-loaded locations:")
-                                
-                                location_names = [loc["name"] for loc in DEMO_LOCATIONS]
-                                
-                                fallback_location = st.selectbox(
-                                    "Select a location:",
-                                    location_names,
-                                    key="fallback_selector"
-                                )
-                                
-                                if st.button("Load this location instead", key="fallback_button"):
-                                    loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == fallback_location)
-                                    
-                                    file_path = loc_data["file"]
-                                    
-                                    if os.path.exists(file_path):
-                                        # Extract coordinates from TIFF
-                                        try:
-                                            with rasterio.open(file_path) as src:
-                                                bounds = src.bounds
-                                                center_lon = (bounds.left + bounds.right) / 2
-                                                center_lat = (bounds.bottom + bounds.top) / 2
-                                                st.session_state.coords = (center_lat, center_lon)
-                                        except:
-                                            st.session_state.coords = (0, 0)
-                                        
-                                        st.session_state.full_path = file_path
-                                        st.session_state.recent_date = "2024-2025"
-                                        st.session_state.location_name = fallback_location  # Store location name
-                                        
-                                        rgb, ndvi = load_sentinel_data(file_path)
-                                        st.session_state.rgb_full = rgb
-                                        st.session_state.ndvi = ndvi
-                                        
-                                        st.session_state.step = 2
-                                        st.rerun()
-                            else:
-                                st.error("No fallback locations available. Please try again later.")
-                
-                except ValueError:
-                    st.error("Please enter valid numbers for latitude and longitude.")
-        
-        # The iconic button!
-        st.markdown("---")
-        if st.button("I'm not a nerd! I don't know coordinates by heart!"):
-            st.session_state.use_city_input = True
+        location_names = [loc["name"] for loc in DEMO_LOCATIONS]
+        selected_location = st.selectbox("Select a location:", location_names)
+
+        if st.button("Load location"):
+            loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == selected_location)
+            file_path = loc_data["file"]
+
+            if not os.path.exists(file_path):
+                st.error(f"Demo file not found: {file_path}")
+                st.stop()
+
+            try:
+                with rasterio.open(file_path) as src:
+                    bounds = src.bounds
+                    center_lon = (bounds.left + bounds.right) / 2
+                    center_lat = (bounds.bottom + bounds.top) / 2
+                    st.session_state.coords = (center_lat, center_lon)
+            except:
+                st.session_state.coords = (0, 0)
+
+            st.session_state.full_path = file_path
+            st.session_state.recent_date = "2025/26"
+            st.session_state.location_name = selected_location
+
+            with st.spinner(f"Loading {selected_location}..."):
+                rgb, ndvi = load_sentinel_data(file_path)
+                st.session_state.rgb_full = rgb
+                st.session_state.ndvi = ndvi
+
+            st.session_state.step = 2
             st.rerun()
-        
-        # Show address input if button was clicked
-        if st.session_state.get("use_city_input", False):
-            st.markdown("### Alternative: Enter city or street name")
-            city_name = st.text_input("Address", value=st.session_state.get("city_name", ""))
-            
-            if st.button("Submit address"):
-                if city_name:
-                    from geopy.geocoders import Nominatim
-                    geolocator = Nominatim(user_agent=st.session_state.username)
-                    
-                    try:
-                        locations = geolocator.geocode(city_name, exactly_one=False, language="en")
-                        
-                        if not locations:
-                            st.error("No results found for this address.")
-                        else:
-                            st.session_state.locations = locations
-                            st.session_state.options = [
-                                f"{loc.address} → lat: {loc.latitude:.5f}, lon: {loc.longitude:.5f}"
-                                for loc in locations
-                            ]
-                            st.session_state.city_name = city_name
-                            st.rerun()
-                    
-                    except Exception as e:
-                        st.error(f"Geocoding failed: {e}")
-            
-            # Show geocoding results if available
-            if "locations" in st.session_state and st.session_state.locations:
-                selected_option = st.radio(
-                    "Choose the city:",
-                    st.session_state.options,
-                    index=0
-                )
-                
-                if st.button("Confirm choice"):
-                    index = st.session_state.options.index(selected_option)
-                    chosen = st.session_state.locations[index]
-                    
-                    lat_val = chosen.latitude
-                    lon_val = chosen.longitude
-                    
-                    st.session_state.coords = (lat_val, lon_val)
-                    
-                    download_message = f"{random.choice(mythical_humanoids)} are fetching your location..."
-                    
-                    with st.spinner(download_message):
-                        try:
-                            full_path, recent_date = download_sentinel_data(
-                                lat_val, lon_val,
-                                st.session_state.username,
-                                mode="recent",
-                                min_coverage=0.99
-                            )
-                            
-                            if full_path is None:
-                                raise Exception("Download returned no data")
-                            
-                            st.session_state.full_path = full_path
-                            st.session_state.recent_date = recent_date
-                            st.session_state.location_name = None  # No display name for custom
-                            
-                            rgb, ndvi = load_sentinel_data(full_path)
-                            st.session_state.rgb_full = rgb
-                            st.session_state.ndvi = ndvi
-                            
-                            st.success("Location loaded successfully!")
-                            st.session_state.step = 2
-                            st.rerun()
-                            
-                        except Exception as download_error:
-                            st.error(f"Download failed: {str(download_error)}")
-                            
-                            if len(DEMO_LOCATIONS) > 0:
-                                st.warning("Due to API rate limits, please choose from pre-loaded locations instead.")
-                                
-                                st.markdown("---")
-                                st.markdown("### Available pre-loaded locations:")
-                                
-                                location_names = [loc["name"] for loc in DEMO_LOCATIONS]
-                                
-                                fallback_location = st.selectbox(
-                                    "Select a location:",
-                                    location_names,
-                                    key="fallback_selector_geocode"
-                                )
-                                
-                                if st.button("Load this location instead", key="fallback_button_geocode"):
-                                    loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == fallback_location)
-                                    
-                                    file_path = loc_data["file"]
-                                    
-                                    if os.path.exists(file_path):
-                                        # Extract coordinates from TIFF
-                                        try:
-                                            with rasterio.open(file_path) as src:
-                                                bounds = src.bounds
-                                                center_lon = (bounds.left + bounds.right) / 2
-                                                center_lat = (bounds.bottom + bounds.top) / 2
-                                                st.session_state.coords = (center_lat, center_lon)
-                                        except:
-                                            st.session_state.coords = (0, 0)
-                                        
-                                        st.session_state.full_path = file_path
-                                        st.session_state.recent_date = "2024-2025"
-                                        st.session_state.location_name = fallback_location  # Store location name
-                                        
-                                        rgb, ndvi = load_sentinel_data(file_path)
-                                        st.session_state.rgb_full = rgb
-                                        st.session_state.ndvi = ndvi
-                                        
-                                        st.session_state.step = 2
-                                        st.rerun()
-    
+
     st.stop()
 
 # -----------------------------
@@ -1213,18 +904,29 @@ if st.session_state.step == 3:
                 index=0 if st.session_state.ws_input == "grayscale_rgb" else 1
             )
             st.caption("Choose what the regions are built from: grayscale emphasizes brightness; NDVI emphasizes vegetation density.")
-            ws_min_region = st.slider(
-                "Minimum region size : number of pixels in a segment",
-                0, 100,
-                int(st.session_state.ws_min_region),
-                step=5
+
+            intensity_threshold = st.slider(
+                "Intensity Threshold", 
+                0.01, 0.50, 
+                float(st.session_state.intensity_threshold), 
+                step=0.01
             )
-            st.caption("Small regions below this size will be merged into the most common neighboring region. Set 0 to disable.")
+            st.caption("Controls the initial grouping. Smaller values = more initial regions.")
+
+            area_thold = st.slider(
+                "Minimum Region Area (pixels)", 
+                10, 2000, 
+                int(st.session_state.area_thold), 
+                step=10
+            )
+            st.caption("Small regions below this size will be absorbed by neighbors.")
+            
             go = st.form_submit_button("Continue")
 
         if go:
             st.session_state.ws_input = "grayscale_rgb" if ws_input == "Grayscale RGB" else "ndvi"
-            st.session_state.ws_min_region = int(ws_min_region)
+            st.session_state.intensity_threshold = float(intensity_threshold)
+            st.session_state.area_thold = int(area_thold)
             st.session_state.step = 4
             st.rerun()
 
@@ -1375,31 +1077,35 @@ if st.session_state.step == 5:
 
             elif st.session_state.seg_method == "region_based":
                 if st.session_state.ws_input == "ndvi":
-                    ndvi = st.session_state.ndvi
-                    ndvi_smooth = smooth_for_watershed(ndvi, sigma=1.5)
-                    ndvi_quant = quantize_for_watershed(ndvi_smooth, levels=32)
-                    gray_u8 = array_to_uint8_gray(ndvi_quant)
+                    input_image = st.session_state.ndvi
                 else:
-                    gray = rgb2gray(rgb_full)
-                    gray_smooth = smooth_for_watershed(gray, sigma=1.5)
-                    gray_quant = quantize_for_watershed(gray_smooth, levels=32)
-                    gray_u8 = array_to_uint8_gray(gray_quant)
+                    input_image = rgb2gray(rgb_full)
 
-                labels = watershed_segmentation(gray_u8)
-                labels = merge_small_regions(labels, min_size=int(st.session_state.ws_min_region))
+                # Optional: A slight gaussian blur helps smooth out satellite noise 
+                # before feeding it into the watershed algorithm
+                input_image = skimage.filters.gaussian(input_image, sigma=1.0)
+
+                # Run the new hierarchical watershed
+                labels = watershed_segmentation(
+                    input_image, 
+                    st.session_state.intensity_threshold, 
+                    st.session_state.area_thold
+                )
                 
-                # Fix label 0 (boundaries) by assigning them to nearest neighbor
-                # This ensures all pixels get classified
+                # Fix label 0 (boundaries/removed objects) by assigning them to nearest neighbor
+                # This ensures the machine learning classifier doesn't crash on unclassified pixels
                 labels = fix_watershed_boundaries(labels)
                 
-                # Store watershed labels as segments
                 st.session_state.segments = labels
                 
                 boundary_mask = labels_to_boundaries(labels)
                 seg_vis = mark_boundaries(rgb_full, boundary_mask, color=(1, 0, 0), mode="thick")
+                
                 st.session_state.seg_params = {
                     "method": "watershed_repo",
-                    "input": st.session_state.ws_input
+                    "input": st.session_state.ws_input,
+                    "intensity_threshold": st.session_state.intensity_threshold,
+                    "area_thold": st.session_state.area_thold
                 }
 
         st.session_state.seg_vis = seg_vis

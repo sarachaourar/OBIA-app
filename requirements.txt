@@ -3,8 +3,12 @@ geopy
 openeo
 rasterio
 pandas
-numpy
+numpy==1.26.0
 matplotlib
 scikit-image
 scikit-learn
 xarray
+cdcd
+tqdm
+higra
+opencv-python==4.8.0.76
