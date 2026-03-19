@@ -8,6 +8,7 @@ matplotlib
 scikit-image
 scikit-learn
 xarray
+cdcd
 tqdm
 higra
 opencv-python==4.8.0.76
